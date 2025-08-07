@@ -1,0 +1,944 @@
+---
+title: "Horse Biomechanics"
+author: "Weslee Nguyen"
+format:
+  html:
+    math: katex
+execute:
+  eval: false
+editor: visual
+---
+
+## Library
+
+```{r}
+
+library(dplyr)      # Pipe operator %>% and other stuff
+library(tidyr)      # Gets df to behave
+library(tidyverse)  # King of all R + has ggplot :)
+library(pracma)     # Numerical Derivatives, too lazy to central derive it
+library(glmnet)     # Perform LASSO + get optimal regularization
+library(Matrix)     # Helps with glmnet I guess? Crashes without it
+library(deSolve)    # Numerical ODE solver; stores function "ode"
+library(gganimate)  # To animate ggplot
+library(extrafont)  # Standardize font for figures (paper + poster)
+
+loadfonts(device = "win")
+set.seed(123)
+```
+
+## Phase 1: Troubleshoot SINDy
+
+We're using **SPARSE IDENTIFICATION OF NONLINEAR DYNAMICS IN R** (**SINDy**), where it "discoveries" (or at least, tries to) the underlying nonlinear dynamical system for some data. If it's [discrete]{.underline} time, then we want a model F s.t. $x_{k + 1} = F(x_k)$ for relevant integers k. Then $y = \begin{bmatrix} y_1 \\ \vdots \\ y_{n-1} \end{bmatrix}, \hat{y} = \begin{bmatrix} y_2 \\ \vdots \\ y_n \end{bmatrix}$, where y and $\hat{y}$ are both the raw data, but slightly shifted. Then we have a potential library of p candidate functions $\Psi(y) = \begin{bmatrix} \psi_1(y) & \cdots & \psi_p(y) \end{bmatrix}$. Then we want $c \ni \hat{y} = \Psi(y)c$, were c "chooses" and "weighs" how well each candidate function fits the data. So we get $c := argmin_c ||\hat{y} - \Psi(y)c||_2^2 + \lambda ||c||_1$ for **REGULARIZATION PARAMETER** $\lambda$, where the higher it is, the sparser it gets. Note that the c formula is termed **LEAST ABSOLUTE SHRINKAGE AND SELECTION OPERATOR**, which I prefer the alternative name $l_1$ **REGULARIZATION** (**LASSO**). So the model is $F(x) := \Psi(x)c$
+
+However, if the data is [continuous]{.underline}, then we slightly modify. y is now all the data, but now we must estimate the derivative per time, say y'. Then we want $y' = \Psi(y)c$ where c is now adapted for $y'$ instead of $\hat{y}$. That gets our model $F(x) := \Psi(x)c$
+
+Now I slightly adapt SINDy. Usually glmnet fits a model to a given set of candidate regularization parameters. But without an obvious parameter to choose, the better option is cv.glmnet, which performs a **K-FOLD CROSS-VALIDATION**, where for various lambdas shoved in, it splits data into training and validation datasets. Then LASSO is performed per lambda. In this case, the default is 10, so for each lambda, the data is split into 10 equally-sized groups, where the model is trained on some 9 and validated on the last group. The validation errors are then averaged across all groups and c is obtained from the one with the lowest error.
+
+```{r}
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# TUTORIAL
+
+# We first want to try the supercritical pitchfork bifurcation ODE
+# dx/dt = 5x - x^3 + epsilon, where epsilon is some noise
+# We first try the discrete case, then move to the continuous case
+
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Define the ODE
+true_ODE <- function(t, x, parms) {
+  dx <- x - (1/3) * x^3
+  list(c(dx))
+}
+
+# Create time sequence 0 to 2.8 in 0.01 increments
+# Have IC t = 0 start at x = 0.1
+times <- seq(0, 10, by = 0.01)
+x0 <- c(x = 0.01)
+
+# "Solve" ODE using RK4, a.k.a. approximate a bunch of time-steps
+sim <- ode(y = x0, times = times, func = true_ODE, 
+           parms = NULL, method = "rk4")
+
+# Get the trajectory and time from the simulation
+x_clean <- sim[, "x"]
+t <- sim[, "time"]
+
+# Add Gaussian Noise, x(t) = x(t) + e where e ~ N(0, 0.05^2)
+x_noisy <- x_clean + rnorm(length(x_clean), sd = 0.1)
+
+df <- data.frame(time = t, x_clean = x_clean, x_noisy = x_noisy)
+ggplot(df, aes(time)) + 
+  geom_line(aes(y = x_clean), color = "blue") +
+  geom_line(aes(y = x_noisy), color = "red") +
+  labs(title = "Clean v. Noisy ODE", y = "x(t)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Continuous Time
+
+# Initialize vector after smoothing
+# Note that SINDy is VERY vulnerable to noise
+spline_fit <- smooth.spline(t, x_noisy, spar = 0.6)
+x <- predict(spline_fit, t, deriv = 0)$y
+
+# Manually construct library
+Theta <- cbind(1, x, x^2, x^3)
+colnames(Theta) <- c("1", "x", "x^2", "x^3")
+
+# Get central derivative
+dx <- gradient(x, dt)
+
+# Perform LASSO (alpha = 1) using cv.glmnet to fit data
+# Lambda is a 100 candidates spaced logarithmically
+
+# lambda.min = Minimizes cross validation error
+# lambda.1se = Sacrifices "best fit" for sparsity of terms <- do this one
+fit <- cv.glmnet(Theta, dx, alpha = 1)
+coef(fit, s="lambda.1se")
+```
+
+## Phase 2: Model Horse Standing and Walking
+
+### Step 2.1: Flesh out Theoretics
+
+For a dynamical system, standing still is equivalent to being at a fixed point. What about walk? Based on the work of Golubitsky, Stewart, and others, quadripedal gait can be modeled via an 8 cell network, where a **CELL** is a system of ODEs. There's technically a lot of assumptions, but these are the most critical ones:
+
+(**1**) The animal, thus the model, needs to have bilateral, translational symmetry.
+
+The bilateral symmetry mostly makes sense, where any left node has an "equal" right node. The translational symmetry somewhat: for a millipede, then a pair of legs and the pair above are basically the same. But for horses, this means the cells for the front legs are the same as the back. This is intuitively not true, but can be reasonably rectified by having a unidirectional, or some uneven, coupling between both pairs to nuance this asymmetry.
+
+(**2**) The cells are indisguishable.
+
+This also intuitively seems weird: wouldn't say the left front v. right hind legs be different in many ways? However, we're primarily interested in building a **basic** model. So while say biceps are in the forelimbs, hamstrings in their hindlimbs, we can treat each leg has a basic unit of flexors v. extensors. So in this reframing, each cell is a **basic** unit of deciding when to contract v. retract each leg, which fits their observed gaits well (e.g. if galloping, no specific limb(s) are particularly emphasized).
+
+(**3**) The model needs exactly 8 cells.
+
+This is based on "A Modular Network for Legged Locomotion," where Golubitsky et al showed having 4 cells, one per leg, is insufficient to produce horse gaits. They don't have a reason why it's not say 9 or 7 cells, just that the model works with 8, namely they can produce all observed horse gaits. They treat 4 cells has each corresponding to a leg and the other 4 cells as only there to make the model work, but I suppose the other 4 cells can be viewed as "high-order" networks. I want to make a unidirectional coupling from these to the "lower-order" cells that directly control the limbs, but (**I**) that's for another time and (**II**) unfortunately I need the stipend desperately \>\_\_\<.
+
+### Step 2.2: Borrow Model
+
+The "Modular Network" paper uses the **FITZHUGH-NAGUMO EQUATIONS**, which is the system of ODEs per cell. There's no physical interpretation, they just wanted to toy around with any **SUPERCRITICAL HOPF BIFURCATION**, where the model bifurcates (horse switches gait) from a fixed point (standing) to a stable limit cycle (some gait the horsie does).
+
+$$
+\dot{x} = c(x + y - \frac{x^3}{3}) := f_1(x, y)
+$$
+
+$$
+\dot{y} = -\frac{1}{c}(x - a + by) := f_2(x, y)
+$$
+
+Then for the state variables $(x_i, y_i)$ per cell, we have undirectional ipsilateral cell couplings $\alpha, \beta$ and bidirectional contralateral couplings $\delta, \gamma$. Have odd cells correspond to the left side of the horse, even cells the right, e.g. 1 for left hind, 2 for right hind, 3 for left front, 4 for right front, 5 for high-order left hind, etc. Then:
+
+$$
+\dot{x}_i = f_1(x_i, y_i, \lambda) + \alpha(x_{i-2} - x_i) + \gamma(x_{i + \epsilon} - x_i)
+$$
+
+$$
+\dot{y}_i = f_2(x_i, y_i, \lambda) + \beta(x_{i-2} - x_i) + \delta(x_{i + \epsilon} - x_i)
+$$
+
+$$
+\epsilon = \begin{cases} +1 & i \text{ odd} \\ -1 & i \text{ even} \end{cases}
+$$
+
+Note that $\lambda$'s are free parameters, which in this context $\lambda = (a, b, c)$.
+
+### Step 2.3: Reproduce Paper
+
+They state that by setting $a = 0.02, b = 0.2$ with initial condition $(x_1, y_1) = (0.06, -0.04), (x_i, y_i) = (0, 0), 2 \leq i \leq 8$, simulations can be reproduced. There's the following gait-parameters that hopefully can be reproduced:
+
+| [Gait]{.underline} | $c$  | $\alpha$ | $\beta$ | $\gamma$ | $\delta$ |
+|--------------------|------|----------|---------|----------|----------|
+| **Walk**           | 0.44 | -0.01    | 0.0102  | -0.025   | 0.02     |
+| **Trot**           | 0.44 | -0.02    | -0.002  | -0.025   | 0.015    |
+| **Pace**           | 0.44 | 0.025    | 0.02    | -0.01    | -0.012   |
+
+We first see if we can gather these gaits. Additionally, hopefully we can find parameters can model canter and a transverse gallop. Ideally, as horses naturally go stand-walk-trot-canter-gallop in that order of increasing speed, there's some natural way to continuously increase parameters to get there and witness what the bifurcations look like.
+
+```{r}
+
+# Step 2.3.1: Initialize model
+
+a <- 0.02
+b <- 0.2
+c <- 0.44
+
+# FitzHugh Nagumo eqns
+
+f1 <- function(x, y) {c * (x + y - x^3 / 3)}
+f2 <- function(x, y) {-1/c * (x - a + b * y)}
+
+# I know %% usually gives mod, but say I have cell 8
+# Then 8 %% 8 = 0. But we can't have index 0
+# So then cells 1 - 7 are fine, and (8 - 1)mod8 = 7 + 1 = 8 :)
+
+mod8 <- function(i) ((i - 1) %% 8) + 1
+
+# Now initialize the ODE
+# t = time, state = vector e.g. initial condition
+
+CPG_ode <- function(t, state, parameters) {
+  
+  alpha <- parameters$alpha
+  beta <- parameters$beta
+  gamma <- parameters$gamma
+  delta <- parameters$delta
+  
+  # Initializes 0 vector in R^8
+  dx <- numeric(8)
+  dy <- numeric(8)
+  
+  # Puts x, y into acceptable format
+  x <- state[1:8]
+  y <- state[9:16]
+  
+  # Update small change in dx, dy per cell
+  for (i in 1:8) {
+    
+    # Ipsilateral limb
+    i_2 <- mod8(i - 2)
+    
+    # Contralateral limb
+    epsilon <- ifelse((i && 2) == 1, +1, -1)
+    i_eps <- mod8(i + epsilon) # mod8 is unnecessary but just to be safe
+    
+    dx[i] <- f1(x[i], y[i]) + 
+      alpha * (x[i_2] - x[i]) + 
+      gamma * (x[i_eps] - x[i])
+    
+    dy[i] <- f2(x[i], y[i]) +
+      beta * (y[i_2] - y[i]) +
+      delta * (y[i_eps] - y[i])
+    
+  }
+  
+  return(list(c(dx, dy)))
+}
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 2.3.2: Solve ODE and Plot Gait + get a plot poster-worthy
+
+# Time sequence + IC per usual
+times <- seq(0, 1000, by = 0.1)
+x_init <- c(0.06, rep(0, 7))
+y_init <- c(0.04, rep(0, 7))  # Oops, caught this too late though
+state0 <- c(x_init, y_init)
+
+# Choose gait here, in this case we start with Transverse Gallop
+parms <- list(
+  alpha = 0.01,
+  beta = 0.01,
+  gamma = -0.01,
+  delta = -0.01
+)
+
+# Solve :O
+sims <- ode(y = state0, times = times, func = CPG_ode,
+            parms = parms, method = "rk4")
+
+df <- sims[, 1:5]
+colnames(df) <- c("Time", "x1 [LH]", "x2 [RH]", "x3 [LF]", "x4 [RF]")
+df <- as.data.frame(df)
+
+# Long-format
+df_long <- df %>%
+  pivot_longer(-Time, names_to = "Limb", values_to = "Value")
+
+
+ggplot(df_long, aes(x = Time, y = Value, color = Limb,
+                    linetype = Limb, size = Limb)) +
+  geom_line() +
+  scale_linetype_manual(values = c("x1 [LH]" = "dashed", "x2 [RH]" = "dashed",
+                                 "x3 [LF]" = "solid", "x4 [RF]" = "solid")) +
+  scale_size_manual(values = c("x1 [LH]" = 2, "x2 [RH]" = 2, 
+                               "x3 [LF]" = 1, "x4 [RF]" = 1)) +
+  xlim(c(980, 1000)) +
+  scale_color_manual(values = c(
+    "x1 [LH]" = "#1E5288",
+    "x2 [RH]" = "#EF4056",
+    "x3 [LF]" = "#378DBD",
+    "x4 [RF]" = "#AB0520"
+  )) +
+  labs(
+    x = "Steps",
+    y = expression(x[i]),
+    title = "CPG Output for Pace Gait"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 2.3.3: Get more plots paper-worthy
+
+# Will have to reload relevant parts again
+a <- 0.02
+b <- 0.5
+c <- 2.4
+
+# Transverse Gallop
+parms <- list(
+  alpha = 0.01,
+  beta = -0.01,
+  gamma = -0.01,
+  delta = 0.01
+)
+
+# Pace
+parms <- list(
+  alpha = 0.01,
+  beta = 0.01,
+  gamma = -0.01,
+  delta = -0.01
+)
+
+# Bound
+parms <- list(
+  alpha = -0.01,
+  beta = -0.01,
+  gamma = 0.01,
+  delta = 0.01
+)
+
+# Pronk
+parms <- list(
+  alpha = -0.01,
+  beta = 0.01,
+  gamma = -0.01,
+  delta = 0.01
+)
+
+# Trot
+parms <- list(
+  alpha = -0.04,
+  beta = 0,
+  gamma = -0.01,
+  delta = 0
+)
+
+sims <- ode(y = state0, times = times, func = CPG_ode,
+            parms = parms, method = "rk4")
+
+df <- sims[, 1:5]
+colnames(df) <- c("Time", "x1 [LH]", "x2 [RH]", "x3 [LF]", "x4 [RF]")
+df <- as.data.frame(df)
+
+df_long <- df %>%
+  pivot_longer(-Time, names_to = "Limb", values_to = "Value")
+
+ggplot(df_long, aes(x = Time, y = Value, color = Limb,
+                    linetype = Limb, size = Limb)) +
+  geom_line() +
+  scale_linetype_manual(values = c("x1 [LH]" = "dashed", "x2 [RH]" = "dashed",
+                                 "x3 [LF]" = "solid", "x4 [RF]" = "solid")) +
+  scale_size_manual(values = c("x1 [LH]" = 2, "x2 [RH]" = 2, 
+                               "x3 [LF]" = 1, "x4 [RF]" = 1)) +
+  xlim(c(980, 1000)) +
+  scale_color_manual(values = c(
+    "x1 [LH]" = "red",
+    "x2 [RH]" = "orange",
+    "x3 [LF]" = "blue",
+    "x4 [RF]" = "purple"
+  )) +
+  labs(
+    x = "Steps",
+    y = expression(x[i]),
+    title = "CPG Gait Output"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(family = "Times New Roman"))
+```
+
+Unfortunately, I couldn't reproduce the paper. However, these are the following gaits I could reproduce. If not stated, then $(a, b, c) = (0.02, 0.2, 0.44)$
+
+| [Gait]{.underline} | c   | $\alpha$ | $\beta$ | $\gamma$ | $\delta$ |
+|--------------------|-----|----------|---------|----------|----------|
+| **Pace**           |     | 0.01     | 0.01    | -0.01    | -0.01    |
+| **Walk**           |     | 0.01     | -0.01   | -0.01    | -0.01    |
+| **Trans Gallop**   |     | 0.01     | -0.01   | -0.01    | 0.01     |
+| **Trot**           | 2.4 | 0.01     | -0.01   | -0.01    | 0.01     |
+| **Bound**          | 3.1 | 0.01     | -0.01   | -0.01    | 0.01     |
+| **Stand**          |     | 0.01     | 0.01    | 0.01     | 0.01     |
+
+Observe that with c and $\alpha$ constant, that means we can still reproduce pace, walk, transverse gallop, and standing for $(\beta, \gamma, \delta) \in \mathbb{R}^3$. Thus, we would map out the gaits from the 3D cube $\times_{i=1}^3 [-0.01, 0.01]$ and see what we get. I'll use 0.004 increments, which means $6^3 = 216$ points would be mapped out.
+
+[Edit]{.underline}: Long-story short, I'm interested in Transverse Gallop, which means I have to make the cube bigger.
+
+### Step 2.4: Map out Gait Cube
+
+```{r}
+
+# Step 2.4.1: Standardize function used
+
+times <- seq(0, 3000, by = 0.1)
+gait_plotter <- function(alpha, beta, gamma, delta) {
+  
+  parms <- list(
+    alpha = alpha,
+    beta = beta,
+    gamma = gamma,
+    delta = delta
+  )
+  
+  sims <- ode(y = state0, times = times, func = CPG_ode,
+              parms = parms, method = "rk4")
+  
+  df <- sims[, 1:5]
+  colnames(df) <- c("Time", "x1 [LH]", "x2 [RH]", "x3 [LF]", "x4 [RF]")
+  df <- as.data.frame(df)
+  
+  df_long <- df %>%
+    pivot_longer(cols = starts_with("x"), 
+                 names_to = "cell", values_to = "value")
+  
+  caption <- 
+    paste0("(α,β,γ,δ)=(", alpha, ", ", beta, ", ", gamma, ", ", delta, ")")
+  
+  plot <- ggplot(df_long, aes(x = Time, y = value, color = cell, 
+                              linetype = cell, size = cell)) +
+    geom_line() +
+    scale_color_manual(values = c("x1 [LH]" = "red", "x2 [RH]" = "green", 
+                                  "x3 [LF]" = "blue", "x4 [RF]" = "black")) +
+    scale_linetype_manual(values = c("x1 [LH]" = "dashed", "x2 [RH]" = "dashed",
+                                   "x3 [LF]" = "solid", "x4 [RF]" = "solid")) +
+    scale_size_manual(values = c("x1 [LH]" = 2, "x2 [RH]" = 2, 
+                                 "x3 [LF]" = 1, "x4 [RF]" = 1)) +
+    guides(
+      color = guide_legend(title = "Cell"),
+      linetype = guide_legend(title = "Cell"),
+      size = guide_legend(title = "Cell")
+    ) +
+    xlim(c(980, 1000)) +
+    labs(
+      title = "FitzHugh–Nagumo CPG",
+      x = "Time",
+      y = expression(x[i]),
+      color = "Cell",
+      caption = caption
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(plot)
+  
+  # # Relative to folder where this qmd file lies
+  # filename <- paste0("Plot_Dump/CPGa", alpha, "_b", beta, "_g", gamma, "_d", delta, ".png")
+  # 
+  # ggsave(filename = filename, plot = plot,
+  #        width = 4, height = 4, dpi = 300, bg = "white")
+  
+}
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 2.4.2: Initialize cube list
+# This is 11^4 .... get ready to run this in your sleep
+
+set <- seq(-0.02, 0.02, by = 0.004)
+cube <- expand.grid(
+  alpha = set,
+  beta = set,
+  gamma = set,
+  delta = seq(-0.004, 0.02, by = 0.004)
+)
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 2.4.3: Make a bunch of plots :(
+# Unfortunately I would have to verify plot one at a time
+
+for (i in 1:nrow(cube)) {
+  
+  alpha <- cube$alpha[i]
+  beta <- cube$beta[i]
+  gamma <- cube$gamma[i]
+  delta <- cube$delta[i]
+  
+  gait_plotter(alpha, beta, gamma, delta)
+  
+}
+
+# Note that I had to manually extend the time to let it converge to a gait
+  # for certain parameter combinations, not really predictable
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 2.4.4: Retrieve csv file and plot out cube
+
+gait_cube <- read.csv("Equine_Gait_Cube.csv")
+
+###########################################################################
+
+# First have it static
+
+# Relabel NAs and trans gallop to something reasonable
+
+gait_cube <- gait_cube %>%
+  mutate(
+    gait = case_when(
+      is.na(gait) ~ "Not a Gait",
+      gait == "Trans Gallop" ~ "Transverse Gallop",
+      TRUE ~ gait
+    )
+  )
+
+names(gait_cube)[3] <- "δ"
+
+# Color palette is hopefully good, maybe swap out magenta but not sure yet
+gait_colors <- c(
+  "Stand" = "gray",
+  "Walk" = "darkblue",
+  "Pace" = "magenta",
+  "Transverse Gallop" = "red",
+  "Not a Gait" = "white"
+)
+
+gait_cube$gait <- factor(gait_cube$gait, levels = c(
+  "Not a Gait", "Stand", "Walk", "Pace", "Transverse Gallop"
+))
+
+# Essentially take cube and slice it via deltas
+ggplot(gait_cube, aes(x = beta, y = gamma, fill = gait)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = gait_colors) +
+  facet_wrap(~ δ, labeller = label_both) +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+  labs(title = "Modeled Equine Gait across Slices", 
+       fill = "Gait",
+       x = "β",
+       y = "γ") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+###########################################################################
+
+# Now have it ... not static
+# Turns out straight up 3D plotting the cube is very ugly and unintuitive
+
+names(gait_cube)[3] <- "delta"
+
+p <- ggplot(gait_cube, aes(x = beta, y = gamma, fill = gait)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = c(
+    "Not a Gait" = "white",
+    "Stand" = "gray",
+    "Walk" = "darkblue",
+    "Pace" = "magenta",
+    "Transverse Gallop" = "red"
+  )) +
+  labs(
+    title = "Gait Map at Coupling Strength #2 = {closest_state}",
+    x = "Ipsilateral Coupling Strength", 
+    y = "Contralateral Coupling Strength #1", 
+    fill = "Gait"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  transition_states(delta, transition_length = 1, 
+                    state_length = 1) +
+  ease_aes('linear')
+
+p <- animate(gg, width = 600, height = 500, fps = 100)
+anim_save("3D_Gait_Cube_Animated.gif", p)
+```
+
+### Step 2.5: Sensitivity Analysis of Initial Conditions
+
+I'll take pace for $(a, b, c, \alpha, \beta, \gamma, \delta) = (0.02, 0.2, 0.44, 0.1, 0.1, -0.1, -0.1)$, randomly sample $x_i, y_i \in [-0.1, 0.1]$ uniformly $\forall 1 \leq i \leq 8$, and see what gaits arise.
+
+```{r}
+
+# Copy and paste basically
+
+times <- seq(0, 1000, by = 0.1)
+
+# Transverse Gallop, else (0.01, 0.01, -0.01, -0.01) for Pace
+parms <- list(
+  alpha = 0.01,
+  beta = -0.01,
+  gamma = -0.01,
+  delta = 0.01
+)
+
+for (i in 1:20) {
+  
+  state0 <- runif(16, min = -0.1, max = 0.1)
+  
+  sims <- ode(y = state0, times = times, func = CPG_ode,
+              parms = parms, method = "rk4")
+  
+  df <- sims[, 1:5]
+  colnames(df) <- c("Time", "x1 [LH]", "x2 [RH]", "x3 [LF]", "x4 [RF]")
+  df <- as.data.frame(df)
+  
+  df_long <- df %>%
+    pivot_longer(cols = starts_with("x"), 
+                 names_to = "cell", values_to = "value")
+  
+  p <- ggplot(df_long, aes(x = Time, y = value, color = cell)) +
+    geom_line(size = 1) +
+    xlim(c(980, 1000)) +
+    labs(
+      title = "FitzHugh–Nagumo CPG",
+      x = "Time",
+      y = expression(x[i]),
+      color = "Cell"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p)
+  
+}
+```
+
+## Phase 3: Observe Supercritical Hopf Bifurcation
+
+Thanks to the cube, we can see that going from standing to walking and back is as simple as varying 1 parameter, which was done successfully using $\beta, \delta$, or $\gamma$. For simplicity, we want to vary only one parameter and carefully observe the bifurcation by very slowly varying one parameter.
+
+Set $(a, b, c, \alpha) = (0.02, 0.2, 0.44, 0.01)$ with the usual initial conditions. I have walk $(\beta, \gamma, \delta) = (-0.05, 0.01, -0.01)$ and stand as $(\beta, \gamma, \delta) = (0, 0.01, -0.01)$, and I'll vary $\beta$ as little as possible.
+
+### Step 3.1: Obtain the Bifurcation Graph
+
+```{r}
+
+# Step 3.1.1: Get a good reference point for walk and stand
+
+gait_plotter(0.01, -0.05, 0.01, -0.01)  # Chosen to "accentuate" amplitudes
+gait_plotter(0.01, 0, 0.01, -0.01)      # Chosen as beta = 0 is "clean"
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.2: Develop code to map out amplitudes
+
+# I) Get f' = 0 for x1 to x4 for times 980 to 1000
+# II) Get all maxes and mins for times 980 to 1000
+# III) If range of maxes or mins exceeds 0.01, restart 1-2 but for 
+        # (1000k + 980, 1000(k + 1)), initialized k = k + 1
+# IV) Otherwise, get the amplitude avg(max) - avg(min)
+# V) Put that into df with columns (beta, amp)
+# VI) Start from beta = -0.05 and increase in -0.001 increments to 0
+# VII) Map out xy scatter plot of (beta, amp)
+
+###########################################################################
+
+# Copy paste ICs
+x_init <- c(0.06, rep(0, 7))
+y_init <- c(0.04, rep(0, 7))
+state0 <- c(x_init, y_init)
+
+# 1) Find the amplitude for a given set of parameters
+
+max_min_finder <- function(parms) {
+  
+  k <- 0
+  
+  repeat{
+    
+    maxes <- c()
+    mins <- c()
+    
+    times <- seq(0, 1000*(k + 3), by = 0.01)
+    data  <- as.data.frame(ode(y = state0, times = times, func = CPG_ode,
+                               parms = parms, method = "rk4"))
+
+    for (l in k:(k + 2)) {
+      
+      short_data <- data[(100000*l + 99801):(100000*(l + 1) + 1), 1:5]
+      colnames(short_data) <- c("Time", "x1", "x2", "x3", "x4")
+      
+      for (i in 1:4) {
+      
+        # Still using Central Differences Method to get dx[i]/dt
+        # Would overwrite dxi everytime, but doesn't matter since maxes / mins kept
+        short_data$dxi <- gradient(short_data[, i + 1], 0.01)
+  
+        # Get all relevant times dx[i]/dt = 0
+        dxi_zeros <- which(diff(sign(short_data$dxi)) != 0)
+  
+        # dxi_times gets the dxi right before dxi swaps sign, so if it's (+), then
+        # it's a min and vice versa. The only exceptions is if it's a saddle, which
+        # isn't possible as the model is oscillatory, or flat, which that's ok, or
+        # dxi = 0 doesn't occur in domain = the model didn't converge yet
+        
+        for (j in dxi_zeros) {
+          
+          if (short_data$dxi[j] > 0) {
+            maxes <- c(maxes, short_data[j, i + 1])
+            }
+          else if (short_data$dxi[j] < 0) {
+            mins <- c(mins, short_data[j, i + 1])
+          }
+        } # End of j for loop
+      }   # End of i for loop
+    }     # End of l for loop
+
+    # With each maxes / mins gathered per xi, now compare to see convergence
+    # Either it oscillates and maxes don't vary that much (same with mins)
+    # OR it doesn't oscillate and the global max / min is negligibly different
+    # Note that with 3 models, we also ensure convergence across wide times
+    data <- data[(100000*(k + 2) + 99801):(100000*(k + 3)), 1:5]
+    
+    if ((length(maxes) > 0 && length(mins) > 0 && 
+         (diff(range(maxes)) < 0.01) && diff(range(mins)) < 0.01) ||
+         (diff(range(data[, 2:5])) < 0.001))
+    {
+      break
+    }
+  
+    k <- k + 3 # If it doesn't converge, extend time to see if it'll converge now
+    
+  }
+  
+  return(mean(maxes) - mean(mins))
+  
+}
+
+###########################################################################
+
+# 2) Put all the (beta, amps) into a df
+
+values <- seq(-0.05, 0, by = 0.001)
+set_of_parms <- lapply(values, function(b) {
+  
+  list(alpha = 0.01,
+       beta = b,
+       gamma = 0.01, 
+       delta = 0.01)
+  
+  }
+)
+
+bifurcation_gait_df <- function(set_of_parms, param_name) {
+  
+  df <- data.frame(
+    param = numeric(),
+    amp = numeric()
+  )
+  
+  for (i in seq_along(set_of_parms)) {
+    
+    amp <- max_min_finder(set_of_parms[[i]])
+    df <- rbind(df, data.frame(param = set_of_parms[[i]][[param_name]], amp = amp))
+    
+    print(paste0(i, ", ", set_of_parms[[i]][[param_name]], ", ", amp))
+    
+  }
+  
+  return(df)
+  
+}
+
+walk_to_stand <- bifurcation_gait_df(set_of_parms, "beta")
+
+###########################################################################
+
+ggplot(walk_to_stand, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Walk to Stand Transition",
+    x = "β", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.2: Pace to stand
+
+# Vary gamma
+gait_plotter(0.01, 0.01, 0.01, 0.01)
+gait_plotter(0.01, -0.03, 0.01, 0.01)
+
+values <- seq(-0.05, 0.01, 0.001)
+set_of_parms <- lapply(values, function(d) {
+  
+  list(alpha = 0.01,
+       beta = 0,
+       gamma = d, 
+       delta = 0.01)
+  
+  }
+)
+
+pace_to_stand <- bifurcation_gait_df(set_of_parms, "gamma")
+
+ggplot(pace_to_stand, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Pace to Stand Transition",
+    x = "γ", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.3: Transverse Gallop to stand
+
+# Vary beta
+gait_plotter(0.01, -0.05, 0.01, 0.01)
+gait_plotter(0.01, 0, 0.01, 0.01)
+
+values <- seq(-0.05, 0.01, 0.001)
+set_of_parms <- lapply(values, function(b) {
+  
+  list(alpha = 0.01,
+       beta = b,
+       gamma = 0.01, 
+       delta = 0.01)
+  
+  }
+)
+
+trans_to_stand <- bifurcation_gait_df(set_of_parms, "beta")
+
+ggplot(trans_to_stand, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Transverse Gallop to Stand Transition",
+    x = "β", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.4: Walk to pace
+
+gait_plotter(0.01, -0.05, -0.01, -0.01)
+gait_plotter(0.01, 0.01, -0.01, -0.01)
+
+values <- seq(-0.05, 0.01, 0.001)
+set_of_parms <- lapply(values, function(b) {
+  
+  list(alpha = 0.01,
+       beta = b,
+       gamma = -0.01, 
+       delta = -0.01)
+  
+  }
+)
+
+walk_to_pace <- bifurcation_gait_df(set_of_parms, "beta")
+
+ggplot(walk_to_pace, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Walk to Pace Transition",
+    x = "β", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.5: Pace to Transverse Gallop
+
+gait_plotter(0.01, -0.01, -0.02, -0.02)
+gait_plotter(0.01, -0.01, -0.02, 0.02)
+
+values <- seq(-0.02, 0.02, 0.001)
+set_of_parms <- lapply(values, function(d) {
+  
+  list(alpha = 0.01,
+       beta = -0.01,
+       gamma = -0.02, 
+       delta = d)
+  
+  }
+)
+
+walk_to_pace <- bifurcation_gait_df(set_of_parms, "delta")
+
+ggplot(walk_to_pace, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Pace to Transverse Gallop Transition",
+    x = "δ", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+
+###########################################################################
+###########################################################################
+###########################################################################
+
+# Step 3.1.6: Walk to Transverse Gallop
+
+gait_plotter(0.01, -0.02, 0.01, 0.01)  # TG
+gait_plotter(0.01, -0.02, 0.01, -0.04) # Walk
+
+values <- seq(-0.04, 0.01, 0.001)
+set_of_parms <- lapply(values, function(d) {
+  
+  list(alpha = 0.01,
+       beta = -0.01,
+       gamma = -0.02, 
+       delta = d)
+  
+  }
+)
+
+walk_to_pace <- bifurcation_gait_df(set_of_parms, "delta")
+
+ggplot(walk_to_pace, aes(x = param, y = amp)) +
+  geom_point(color = "red") +
+  labs(
+    title = "Walk to Transverse Gallop Transition",
+    x = "δ", 
+    y = "Gait Oscillatory Amplitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12, family = "Times New Roman"))
+```
